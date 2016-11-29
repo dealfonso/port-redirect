@@ -1,0 +1,361 @@
+#!/bin/bash
+#
+# port-redirect - Manages the IP rules to ease port redirection
+#
+# Copyright (C) GRyCAP - I3M - UPV 
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+DEBUG=True
+
+if [ "$DEBUG" == "True" ]; then
+    DEBUG_RULES_FILE=output.txt
+    function iptables_save() {
+        cat "$DEBUG_RULES_FILE"
+    }
+    function create_redirection() {
+        local S_PORT=$1 D_IP=$2 D_PORT=$3 
+        RULE_STR="-p tcp -m tcp --dport $S_PORT -j DNAT --to-destination $D_IP:$D_PORT"
+        N_FILE=$(tempfile)
+        cat "$DEBUG_RULES_FILE" > "$N_FILE"
+        echo "-A PREROUTING $RULE_STR" >> "$N_FILE"
+        mv "$N_FILE" "$DEBUG_RULES_FILE"
+    }
+    function delete_redirection() {
+        local S_PORT=$1 D_IP=$2 D_PORT=$3 
+        RULE_STR="-p tcp -m tcp --dport $S_PORT -j DNAT --to-destination $D_IP:$D_PORT"
+        N_FILE=$(tempfile)
+        cat "$DEBUG_RULES_FILE" | grep -v -- "$RULE_STR" > "$N_FILE"
+        mv "$N_FILE" "$DEBUG_RULES_FILE"
+    }
+else
+    RESTORE_FILE=/etc/iptables.rules
+    function iptables_save() {
+        iptables-save
+    }
+    function create_redirection() {
+        local S_PORT=$1 D_IP=$2 D_PORT=$3 
+        iptables -t nat -A PREROUTING -p tcp -m tcp --dport $S_PORT -j DNAT --to-destination $D_IP:$D_PORT
+        iptables-save > $RESTORE_FILE
+    }
+
+    function delete_redirection() {
+        local S_PORT=$1 D_IP=$2 D_PORT=$3 
+        iptables -t nat -D PREROUTING -p tcp -m tcp --dport $S_PORT -j DNAT --to-destination $D_IP:$D_PORT
+        iptables-save > $RESTORE_FILE
+    }
+fi
+
+function p_error() {
+    echo "[ERROR] $1" >&2
+}
+
+function count_lines() {
+    echo "$1" | sed '/^[ ]*$/d' | wc -l    
+}
+
+function add_ip() {
+    local IP COUNT V_EX IP1 IP2 IP3 IP4
+    IP=$1
+    COUNT=${2:-1}
+
+    IFS='.' read IP1 IP2 IP3 IP4 <<< "$IP"
+
+    V_EX=$(( 0x$(printf "%02x%02x%02x%02x" $IP1 $IP2 $IP3 $IP4) + 0x$COUNT ))
+    IP4=$(($V_EX & 0xff))
+    IP3=$(($V_EX >> 8 & 0xff ))
+    IP2=$(($V_EX >> 16 & 0xff))
+    IP1=$(($V_EX >> 24 & 0xff))
+    echo "$IP1.$IP2.$IP3.$IP4"
+}
+
+function check_ip() {
+    local IP1 IP2 IP3 IP4 IP5
+    IFS='.' read IP1 IP2 IP3 IP4 IP5 <<< "$1"
+    if [ "$IP1" == "" -o "$IP2" == "" -o "$IP3" == "" -o "$IP4" == "" -o "$IP5" != "" ]; then 
+        return 1
+    fi
+    return 0
+}
+
+function usage() {
+    echo "Usage:" 
+    case "$1" in
+        delete)
+        cat <<EOT
+    $0 [options] delete [--src-port|-s] <port> [--check-only|c]
+    $0 [options] delete [--dest-ip|-i] <ip> [--dest-port|-d] <port> [--all] [--check-only|c]
+EOT
+        ;;    
+        create)
+        cat <<EOT
+    $0 [options] create [--src-port|-s] <port> [--dest-ip|-i] <ip> [--dest-port|-d] <port> [--check-only|c]
+EOT
+        ;;    
+        get)
+        cat <<EOT
+    $0 [options] get [ [--src-port|-s] <port> ] [ [--dest-ip|-i] <ip> ] [ [--dest-port|-d] <port> ]
+EOT
+        ;;
+        init)
+        cat <<EOT
+    $0 [options] init
+EOT
+        *)
+        cat <<EOT
+    $0 [options] [ get | delete | create ] [ options ] --help  
+EOT
+        ;;
+    esac
+}
+
+function get_redirections_filtered() {
+    local i P S_PORT D_IP D_PORT F_D_IP F_D_PORT F_S_PORT FF_D_IP FF_D_PORT FF_S_PORT
+    F_S_PORT=$1
+    F_D_IP=$2
+    F_D_PORT=$3
+
+    while read LINE; do
+        i=0
+        P=( $(echo "$LINE" | sed 's/-A PREROUTING//;s/-j DNAT//;s/^[ ]*//') )
+        S_PORT= D_IP= D_PORT=
+        while (( i<${#P[@]} )); do
+            case "${P[$i]}" in
+                -p | -m) (( i++ ));;
+                --dport) (( i++ ))
+                         S_PORT=${P[$i]};;
+                --to-destination) (( i++ ))
+                         IFS=':' read D_IP D_PORT <<< "${P[$i]}";;
+            esac
+            (( i++ ))
+        done
+        if [ "$S_PORT" != "" -a "$D_PORT" != "" -a "$D_IP" != "" ]; then
+            FF_D_IP=${F_D_IP:-$D_IP}
+            FF_D_PORT=${F_D_PORT:-$D_PORT}
+            FF_S_PORT=${F_S_PORT:-$S_PORT}
+            if [ "$S_PORT" == "$FF_S_PORT" -a "$D_IP" == "$FF_D_IP" -a "$D_PORT" == "$FF_D_PORT" ]; then
+                echo "$S_PORT;$D_IP;$D_PORT"
+            fi
+        fi
+    done <<< "$(iptables_save | grep PREROUTING)"
+}
+
+function init() {
+    case "$1" in
+        *) usage init && exit 1;;
+    esac
+    echo "1" > /proc/sys/net/ipv4/ip_forward
+    iptables -A POSTROUTING -j MASQUERADE
+}
+
+function delete() {
+    local S_PORT D_PORT D_IP ALL CHECK_ONLY
+    ALL=False
+    while (( $# > 0 )); do
+        case "$1" in
+            --src-port|-s)  shift
+                            S_PORT=$1;;
+            --dst-port|-d)  shift
+                            D_PORT=$1;;
+            --dst-ip|-i)    shift
+                            D_IP=$1;;
+            --all|-a)       ALL=True;;
+            --check-only|-c)    CHECK_ONLY=True;;
+            *)              usage delete && exit 1;;
+        esac
+        shift
+    done
+
+    if [ "$S_PORT" != "" ]; then
+        if [ "$D_IP" != "" -o "$D_PORT" != "" ]; then
+            p_error "it is not possible to combine options"
+            usage delete
+            exit 1
+        fi
+        local REDIRS=$(get_redirections_filtered "$S_PORT" "" "")
+        local C=$(count_lines "$REDIRS")
+
+        if (( C == 0 )); then
+            p_error "no redirection found for port $S_PORT"
+            exit 1
+        fi
+
+        if (( C > 1 )); then
+            p_error "puzzled because multiple redirections found for port $S_PORT"
+            exit 1
+        fi
+
+        IFS=';' read S_PORT D_IP D_PORT <<< "$REDIRS"
+        if [ "$CHECK_ONLY" != "True" ]; then
+            delete_redirection "$S_PORT" "$D_IP" "$D_PORT"
+        fi
+        echo "$S_PORT;$D_IP:$D_PORT"
+
+    elif [ "$D_IP" != "" -o "$D_PORT" != "" ]; then
+        local REDIRS=$(get_redirections_filtered "" "$D_IP" "$D_PORT")
+        local C=$(count_lines "$REDIRS")
+        if (( C > 1 )); then
+            if [ "$ALL" != "True" ]; then
+                p_error "multiple redirections to delete, please be more specific"
+                exit 1
+            fi
+        fi
+
+        if (( C == 0 )); then
+            p_error "no redirections to delete"
+            exit 1
+        fi
+
+        while IFS=';' read S_PORT D_IP D_PORT; do
+            if [ "$CHECK_ONLY" != "True" ]; then
+                delete_redirection "$S_PORT" "$D_IP" "$D_PORT"
+            fi
+            echo "$S_PORT;$D_IP:$D_PORT"
+        done <<< "$REDIRS"
+
+    else
+        p_error "no valid usage of delete"
+        usage delete
+        exit 1
+    fi
+}
+
+function create() {
+    local S_PORT D_PORT D_IP ALL S_PORT_L CHECK_ONLY RESULT
+    while (( $# > 0 )); do
+        case "$1" in
+            --src-port|-s)  shift
+                            S_PORT=$1;;
+            --src-port-last|-l)  shift
+                            S_PORT_L=$1;;
+            --dst-port|-d)  shift
+                            D_PORT=$1;;
+            --dst-ip|-i)    shift
+                            D_IP=$1;;
+            --check-only|-c)    CHECK_ONLY=True;;
+            *)              usage create && exit 1
+        esac
+        shift
+    done
+
+    if [ "$S_PORT" == "" -o "$D_IP" == "" -o "$D_PORT" == "" ]; then
+        p_error "all the options are mandatory"
+        usage create
+        exit 1
+    fi
+
+    S_PORT_L=${S_PORT_L:-$S_PORT}
+    N_PORTS=$(( $S_PORT_L - $S_PORT + 1 ))
+
+    if ! check_ip "$D_IP"; then
+        p_error "IP has not a valid format AA.BB.CC.DD"
+        exit 1
+    fi 
+
+    local REDIRS C C_S_PORT
+    for ((C_S_PORT=$S_PORT; C_S_PORT<=$S_PORT_L; C_S_PORT++)) do
+        REDIRS=$(get_redirections_filtered "$C_S_PORT" "" "")
+        C=$(count_lines "$REDIRS")
+
+        if (( C != 0 )); then
+            p_error "redirection of port $C_S_PORT already exists"
+            exit 1
+        fi
+
+        REDIRS=$(get_redirections_filtered "" "$D_IP" "$D_PORT")
+        C=$(count_lines "$REDIRS")
+
+        if (( C != 0 )); then
+            p_error "redirection to $D_IP:$D_PORT already exists"
+            exit 1
+        fi
+
+        if [ "$CHECK_ONLY" != "True" ]; then
+            create_redirection "$C_S_PORT" "$D_IP" "$D_PORT"
+        fi
+
+        if [ "$RESULT" == "" ]; then
+            RESULT="$C_S_PORT;$D_IP:$D_PORT"
+        else
+            RESULT="$RESULT
+$C_S_PORT;$D_IP:$D_PORT"
+        fi
+
+        D_IP=$(add_ip "$D_IP" 1)
+    done
+    echo "$RESULT"
+}
+
+function get() {
+    while (( $# > 0 )); do
+        case "$1" in
+            --src-port|-s)  shift
+                            S_PORT=$1;;
+            --dst-port|-d)  shift
+                            D_PORT=$1;;
+            --dst-ip|-i)    shift
+                            D_IP=$1;;
+            *)              usage get && exit 1
+        esac
+        shift
+    done
+
+    local REDIRS=$(get_redirections_filtered "$S_PORT" "$D_IP" "$D_PORT" )
+
+    echo -n "["
+    FIRST=True
+    while IFS=';' read S_PORT D_IP D_PORT; do
+        if [ "$S_PORT" != "" ]; then
+            if [ "$FIRST" != "True" ]; then
+                echo -n ","
+            else
+                FIRST=False
+            fi
+            echo -n "{\"port\": \"${S_PORT}\", \"to\": { \"port\": \"${D_PORT}\", \"ip\": \"$D_IP\"} }"
+        fi
+    done <<< "$REDIRS"
+    echo "]"
+}
+
+n=0
+while (( $# > 0 )); do
+    if [ "${1:0:1}" == "-" -a "${1:1:1}" != "-" ]; then
+        for f in $(echo "${1:1}" | sed 's/\(.\)/-\1 /g' ); do
+            ARR[$n]="$f"
+            n=$(($n+1))
+        done
+    else
+        ARR[$n]="$1"
+        n=$(($n+1))
+    fi
+    shift
+done
+
+n=0
+COMMAND=
+while [ $n -lt ${#ARR[@]} -a "$COMMAND" == "" ]; do
+    PARAM="${ARR[$n]}"
+    case "$PARAM" in
+        get|create|delete|init)      COMMAND="$PARAM";;
+        --help | -h)            usage && exit 0;;
+        *)                      usage && exit 1;;
+    esac
+    n=$(($n+1))
+done
+
+if [ "$COMMAND" != "" ]; then
+    $COMMAND "${ARR[@]:$n}"
+else
+    echo "no command issued" && usage && exit 1
+fi
