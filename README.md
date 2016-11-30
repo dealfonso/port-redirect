@@ -8,8 +8,8 @@ This is a tool that eases port redirection to other IP addresses in a network. T
 # Install
 This is a bash script file, so you can download it and put it in a path of your choice. I suggest to put it in /usr/sbin. In this case, the steps are the next:
 ```bash
-# git clone https://github.com/dealfonso/port-redirect
-# cd port-redirect
-# cp port-redirect /usr/sbin
-# chmod +x /usr/bin/port-redirect
+git clone https://github.com/dealfonso/port-redirect
+cd port-redirect
+cp port-redirect /usr/sbin
+chmod +x /usr/bin/port-redirect
 ```
